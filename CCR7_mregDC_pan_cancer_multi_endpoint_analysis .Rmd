@@ -1,0 +1,1272 @@
+---
+title: "CCR7+ mregDC Signature: Multi-Endpoint Pan-Cancer Survival Analysis"
+author: "Survival Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 8)
+
+# ============================================================
+# 💡 Signature定义 - 只需在此处修改！
+# ============================================================
+SIGNATURE_GENES <- c("CCR7", "LAMP3", "FSCN1")  # DC标志基因
+NORMALIZER_GENE <- "CD3G"                        # T细胞标准化基因
+
+# 生成signature名称（用于显示）
+SIGNATURE_NAME <- paste0("(", paste(SIGNATURE_GENES, collapse = " × "), ") / ", NORMALIZER_GENE)
+cat("Signature定义:", SIGNATURE_NAME, "\n")
+# ============================================================
+
+# ============================================================
+# 🎯 多结局配置
+# ============================================================
+# 4个标准化生存结局（来自Liu et al. Cell 2018）
+ENDPOINTS <- c("OS", "DSS", "DFI", "PFI")
+
+# 结局中文名
+ENDPOINT_NAMES_CN <- c(
+  OS = "总生存期",
+  DSS = "疾病特异性生存",
+  DFI = "无病间期",
+  PFI = "无进展间期"
+)
+
+# 结局英文全称
+ENDPOINT_NAMES_EN <- c(
+  OS = "Overall Survival",
+  DSS = "Disease-Specific Survival",
+  DFI = "Disease-Free Interval",
+  PFI = "Progression-Free Interval"
+)
+
+# 结局描述
+ENDPOINT_DESC <- c(
+  OS = "从诊断到任何原因死亡",
+  DSS = "从诊断到疾病相关死亡（排除其他原因）",
+  DFI = "从治愈性治疗到疾病复发",
+  PFI = "从诊断到疾病进展或死亡"
+)
+
+cat("\n本分析将同时分析以下4个生存结局:\n")
+for(ep in ENDPOINTS) {
+  cat("  ✓", ep, "(", ENDPOINT_NAMES_CN[ep], "):", ENDPOINT_DESC[ep], "\n")
+}
+cat("\n数据来源: Liu et al. Cell 2018 - TCGA Pan-Cancer Atlas\n")
+# ============================================================
+
+# 创建输出文件夹
+dir.create("data_xena", showWarnings = FALSE)
+dir.create("results_multi_endpoint", showWarnings = FALSE)
+dir.create("figures_multi_endpoint", showWarnings = FALSE)
+
+# 为每个结局创建子文件夹
+for(ep in ENDPOINTS) {
+  dir.create(file.path("results_multi_endpoint", ep), showWarnings = FALSE)
+  dir.create(file.path("figures_multi_endpoint", ep), showWarnings = FALSE)
+}
+```
+
+# 项目简介
+
+本分析使用**UCSC Xena TCGA Pan-Cancer Atlas数据**，对所有TCGA癌症类型进行CCR7+ mregDC signature的**多结局生存分析**。
+
+## 🎯 多结局分析特点
+
+- 📊 **4个标准化结局** - OS, DSS, DFI, PFI（Liu et al. Cell 2018）
+- 🔍 **全面评估** - 一次分析了解signature在不同临床结局中的预后价值
+- 📈 **对比分析** - 识别在多个结局中都显著的癌症类型
+- ✅ **高质量数据** - TCGA Pan-Cancer Atlas标准化处理
+
+## CCR7+ mregDC Signature 定义
+
+```{r display_signature, echo=FALSE}
+cat("CCR7+mregDC signature =", SIGNATURE_NAME, "\n\n")
+cat("生存结局:\n")
+for(ep in ENDPOINTS) {
+  cat("  -", ep, "(", ENDPOINT_NAMES_CN[ep], "):", ENDPOINT_DESC[ep], "\n")
+}
+```
+
+---
+
+# 1. 环境设置
+
+```{r load_libraries, message=FALSE}
+# 加载所需的包
+library(survival)
+library(survminer)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+cat("✓ 所有包加载成功！\n")
+```
+
+---
+
+# 2. 下载Pan-Cancer数据
+
+```{r download_data}
+cat("开始下载TCGA Pan-Cancer数据...\n")
+cat("这是一次性下载，包含所有癌症类型的数据\n\n")
+
+# 增加下载超时时间
+options(timeout = 600)
+
+# 文件URLs
+exp_url <- "https://tcga-pancan-atlas-hub.s3.us-east-1.amazonaws.com/download/EB%2B%2BAdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena.gz"
+exp_file <- "data_xena/PANCAN_expression.tsv.gz"
+
+clin_url <- "https://tcga-pancan-atlas-hub.s3.us-east-1.amazonaws.com/download/Survival_SupplementalTable_S1_20171025_xena_sp"
+clin_file <- "data_xena/PANCAN_survival.tsv"
+
+phenotype_url <- "https://tcga-pancan-atlas-hub.s3.us-east-1.amazonaws.com/download/TCGA_phenotype_denseDataOnlyDownload.tsv.gz"
+phenotype_file <- "data_xena/PANCAN_phenotype.tsv.gz"
+
+# 带重试的下载函数
+download_with_retry <- function(url, destfile, desc = "文件", max_retries = 3) {
+  if(file.exists(destfile)) {
+    current_size_mb <- file.size(destfile) / (1024 * 1024)
+    cat("  ", desc, "已存在 (", round(current_size_mb, 3), "MB)，跳过下载\n")
+    return(TRUE)
+  }
+
+  cat("  下载", desc, "...\n")
+  use_curl <- Sys.which("curl") != ""
+
+  for(retry in 1:max_retries) {
+    result <- tryCatch({
+      if(use_curl) {
+        exit_code <- system2("curl", args = c("-L", "-o", destfile, url,
+                            "--connect-timeout", "60", "--max-time", "1200",
+                            "--retry", "3", "--retry-delay", "10"),
+                            stdout = FALSE, stderr = FALSE)
+        exit_code == 0 && file.exists(destfile)
+      } else {
+        download.file(url, destfile, mode = "wb", quiet = FALSE)
+        file.exists(destfile)
+      }
+    }, error = function(e) { FALSE })
+
+    if(result) {
+      cat("    ✓", desc, "下载完成\n")
+      return(TRUE)
+    }
+    if(retry < max_retries) {
+      cat("    重试", retry + 1, "/", max_retries, "...\n")
+      Sys.sleep(retry * 10)
+    }
+  }
+  stop(paste("下载失败:", desc))
+}
+
+# 下载文件
+cat("\n1. 表达数据 (~315MB)\n")
+download_with_retry(exp_url, exp_file, "表达数据", max_retries = 5)
+
+cat("\n2. 临床数据 (~2MB)\n")
+download_with_retry(clin_url, clin_file, "临床数据", max_retries = 3)
+
+cat("\n3. 表型数据 (~60KB)\n")
+download_with_retry(phenotype_url, phenotype_file, "表型数据", max_retries = 3)
+
+cat("\n✓ 所有数据下载完成！\n")
+```
+
+---
+
+# 3. 读取和准备数据
+
+```{r load_data}
+cat("读取数据...\n")
+
+# 读取表达数据
+cat("1. 读取表达数据...\n")
+exp_data_raw <- read.table(gzfile(exp_file), header = TRUE, sep = "\t",
+                           check.names = FALSE, stringsAsFactors = FALSE)
+
+gene_names <- exp_data_raw[,1]
+if(any(duplicated(gene_names))) {
+  n_dup <- sum(duplicated(gene_names))
+  cat("   发现", n_dup, "个重复的基因名，将添加后缀处理\n")
+  gene_names <- make.unique(as.character(gene_names))
+}
+
+exp_data <- exp_data_raw[,-1]
+rownames(exp_data) <- gene_names
+cat("   表达矩阵:", nrow(exp_data), "基因 ×", ncol(exp_data), "样本\n")
+
+# 读取临床数据
+cat("2. 读取临床数据...\n")
+clin_data <- read.table(clin_file, header = TRUE, sep = "\t",
+                        stringsAsFactors = FALSE)
+cat("   临床数据:", nrow(clin_data), "样本\n")
+
+# 检查所有结局的可用性
+cat("\n   检查生存结局可用性:\n")
+for(ep in ENDPOINTS) {
+  time_col <- paste0(ep, ".time")
+  event_col <- ep
+
+  has_time <- time_col %in% colnames(clin_data)
+  has_event <- event_col %in% colnames(clin_data)
+
+  if(has_time && has_event) {
+    n_samples <- sum(!is.na(clin_data[[time_col]]) & !is.na(clin_data[[event_col]]))
+    cat("     ✓", ep, "(", ENDPOINT_NAMES_CN[ep], "):", n_samples, "样本可用\n")
+  } else {
+    cat("     ✗", ep, "数据缺失\n")
+  }
+}
+
+cat("\n✓ 所有数据读取完成！\n")
+```
+
+---
+
+# 4. 定义分析函数
+
+```{r define_functions}
+# 癌症类型中文名
+cancer_names_cn <- c(
+  ACC = "肾上腺皮质癌", BLCA = "膀胱癌", BRCA = "乳腺癌",
+  CESC = "宫颈癌", CHOL = "胆管癌", COAD = "结肠癌",
+  DLBC = "弥漫大B细胞淋巴瘤", ESCA = "食管癌", GBM = "胶质母细胞瘤",
+  HNSC = "头颈鳞癌", KICH = "肾嫌色细胞癌", KIRC = "肾透明细胞癌",
+  KIRP = "肾乳头状细胞癌", LAML = "急性髓系白血病", LGG = "低级别胶质瘤",
+  LIHC = "肝癌", LUAD = "肺腺癌", LUSC = "肺鳞癌",
+  MESO = "间皮瘤", OV = "卵巢癌", PAAD = "胰腺癌",
+  PCPG = "嗜铬细胞瘤", PRAD = "前列腺癌", READ = "直肠癌",
+  SARC = "肉瘤", SKCM = "黑色素瘤", STAD = "胃癌",
+  TGCT = "睾丸癌", THCA = "甲状腺癌", THYM = "胸腺瘤",
+  UCEC = "子宫内膜癌", UCS = "子宫癌肉瘤", UVM = "葡萄膜黑色素瘤"
+)
+
+# 函数：计算signature score
+# ⚠️ 重要：gene_expressions 必须是TPM空间的数据
+# 乘积法的生物学意义：在原始表达量空间（TPM）进行乘法
+# 公式：Signature = (CCR7_TPM × LAMP3_TPM × FSCN1_TPM) / CD3G_TPM
+calculate_signature <- function(gene_expressions) {
+  pseudocount <- 0.1  # 避免除零，防止极端值
+
+  # 计算分子：所有signature基因的乘积（在TPM空间）
+  numerator <- 1
+  for(gene in SIGNATURE_GENES) {
+    numerator <- numerator * (gene_expressions[[gene]] + pseudocount)
+  }
+
+  # 计算分母：标准化基因表达（在TPM空间）
+  denominator <- gene_expressions[[NORMALIZER_GENE]] + pseudocount
+
+  # 返回signature score
+  # 结果单位：相对表达量比值（无量纲）
+  return(numerator / denominator)
+}
+
+# 函数：分析单个癌症类型的单个结局
+process_single_endpoint <- function(cancer_code, endpoint, exp_matrix, clinical) {
+
+  ep_cn <- ENDPOINT_NAMES_CN[endpoint]
+  ep_en <- ENDPOINT_NAMES_EN[endpoint]
+
+  cat("\n  --- ", endpoint, " (", ep_cn, ") ---\n", sep="")
+
+  result <- tryCatch({
+
+    # 获取该结局的列名
+    time_col <- paste0(endpoint, ".time")
+    event_col <- endpoint
+
+    # 筛选样本
+    cancer_samples <- clinical %>%
+      filter(cancer.type.abbreviation == cancer_code) %>%
+      pull(sample)
+
+    if(length(cancer_samples) == 0) {
+      stop("未找到样本")
+    }
+
+    cancer_samples <- intersect(cancer_samples, colnames(exp_matrix))
+
+    if(length(cancer_samples) < 30) {
+      stop("样本数太少 (<30)")
+    }
+
+    exp_subset <- exp_matrix[, cancer_samples, drop = FALSE]
+
+    # 提取signature基因
+    all_genes <- c(SIGNATURE_GENES, NORMALIZER_GENE)
+    genes_found <- all_genes %in% rownames(exp_subset)
+
+    if(!all(genes_found)) {
+      missing <- all_genes[!genes_found]
+      stop(paste("缺失基因:", paste(missing, collapse = ", ")))
+    }
+
+    # 提取基因表达并转换到TPM空间
+    # ⚠️ 关键步骤：UCSC Xena数据是log2(TPM+1)格式
+    # 必须转回TPM空间再做乘法运算，否则生物学意义错误！
+    gene_expressions <- list()
+    for(gene in all_genes) {
+      # 原始数据：log2(TPM+1)
+      log_values <- as.numeric(exp_subset[gene, ])
+
+      # 转回TPM空间：TPM = 2^log2(TPM+1) - 1
+      # 这是必须的！乘积法只能在原始TPM空间进行
+      gene_expressions[[gene]] <- 2^log_values - 1
+    }
+
+    # 验证：显示转换后的数据范围（应该是TPM，非负数）
+    # 同时记录异常情况用于质量控制
+    tpm_anomalies <- c()
+    for(gene in all_genes) {
+      gene_range <- range(gene_expressions[[gene]], na.rm = TRUE)
+      cat("    ", gene, " TPM: [", round(gene_range[1], 2), ", ",
+          round(gene_range[2], 2), "]", sep="")
+
+      # 检查是否有异常值并记录
+      if(gene_range[1] < 0) {
+        cat(" ⚠️负数!")
+        tpm_anomalies <- c(tpm_anomalies, paste0(gene, ":负数(", round(gene_range[1], 2), ")"))
+      }
+      if(gene_range[2] > 1e5) {
+        cat(" ⚠️异常大!")
+        tpm_anomalies <- c(tpm_anomalies, paste0(gene, ":异常大(", round(gene_range[2], 0), ")"))
+      }
+      cat("\n")
+    }
+
+    # 汇总异常状态
+    has_anomaly <- length(tpm_anomalies) > 0
+    anomaly_summary <- if(has_anomaly) paste(tpm_anomalies, collapse = "; ") else "正常"
+
+    # 计算signature（在TPM空间）
+    signature_scores <- calculate_signature(gene_expressions)
+
+    results_df <- data.frame(
+      sample_id = cancer_samples,
+      CCR7_mregDC_signature = signature_scores,
+      stringsAsFactors = FALSE
+    )
+
+    # 合并临床数据
+    clinical_clean <- clinical %>%
+      filter(cancer.type.abbreviation == cancer_code) %>%
+      select(sample, all_of(time_col), all_of(event_col)) %>%
+      rename(sample_id = sample, time = all_of(time_col), event = all_of(event_col)) %>%
+      mutate(
+        time = as.numeric(time),
+        event = as.numeric(event)
+      )
+
+    merged_data <- results_df %>%
+      inner_join(clinical_clean, by = "sample_id") %>%
+      filter(!is.na(CCR7_mregDC_signature), !is.na(time), time > 0)
+
+    valid_samples <- nrow(merged_data)
+
+    if(valid_samples < 20) {
+      stop("有效样本数太少 (<20)")
+    }
+
+    # 分组
+    median_sig <- median(merged_data$CCR7_mregDC_signature, na.rm = TRUE)
+    merged_data$group <- ifelse(merged_data$CCR7_mregDC_signature >= median_sig,
+                                "High", "Low")
+
+    # 生存分析
+    if(sum(merged_data$event) < 3) {
+      stop("事件数太少 (<3)")
+    }
+
+    # Kaplan-Meier分析
+    fit <- survfit(Surv(time, event) ~ group, data = merged_data)
+
+    # Log-rank检验
+    surv_diff <- survdiff(Surv(time, event) ~ group, data = merged_data)
+    p_value <- 1 - pchisq(surv_diff$chisq, df = 1)
+
+    # Cox回归（使用分组变量 High vs Low，以 Low 为参考组）
+    merged_data$group <- factor(merged_data$group, levels = c("Low", "High"))
+    cox_uni <- coxph(Surv(time, event) ~ group, data = merged_data)
+    cox_summary <- summary(cox_uni)
+    hr <- as.numeric(exp(coef(cox_uni)))  # HR > 1 表示 High 组风险更高
+    cox_pval <- as.numeric(cox_summary$coefficients[, "Pr(>|z|)"])
+
+    # 计算每组的事件数（用于质量控制）
+    events_high <- sum(merged_data$event[merged_data$group == "High"])
+    events_low <- sum(merged_data$event[merged_data$group == "Low"])
+    total_events <- sum(merged_data$event)
+
+    cat("    样本数:", valid_samples,
+        "| 事件数:", total_events, "(High:", events_high, ", Low:", events_low, ")",
+        "| p =", format(p_value, scientific = TRUE, digits = 3),
+        "| HR =", round(hr, 3), "\n")
+
+    # 保存生存曲线
+    figures_dir <- file.path("figures_multi_endpoint", endpoint, cancer_code)
+    dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
+
+    p_surv <- ggsurvplot(
+      fit,
+      data = merged_data,
+      pval = TRUE,
+      pval.coord = c(0, 0.05),
+      pval.size = 5,                    # 增大p值字体
+      conf.int = FALSE,
+      risk.table = TRUE,
+      risk.table.height = 0.25,
+      xlab = "Time in days",
+      ylab = "Survival probability",
+      title = paste0(cancer_code, " (", cancer_names_cn[cancer_code], "): ",
+                    ep_en, " [", endpoint, "]"),
+      palette = c("#E41A1C", "#377EB8"), # 高对比度颜色：红色(High)和蓝色(Low)
+      legend.title = "CCR7+ mregDC",
+      legend.labs = c("High", "Low"),
+      size = 1.5,                        # 增加线条粗细
+      surv.median.line = "hv",           # 显示中位生存时间
+      ggtheme = theme_minimal(base_size = 14),  # 增大字体
+      tables.theme = theme_cleantable()  # 优化风险表格样式
+    )
+
+    # 保存生存曲线（ggsurvplot对象需要使用传统图形设备保存）
+    # 高分辨率PDF
+    pdf(file.path(figures_dir, "survival_curve.pdf"), width = 10, height = 8)
+    print(p_surv)
+    dev.off()
+
+    # 高分辨率PNG（600 DPI，适合出版）
+    png(file.path(figures_dir, "survival_curve.png"), width = 10, height = 8,
+        units = "in", res = 600)
+    print(p_surv)
+    dev.off()
+
+    # ============ 质量控制检查 ============
+    # 检查标准：
+    # 1. 总事件数 >= 10
+    # 2. 每组事件数 >= 3
+    # 3. HR在合理范围内 (0.01 < HR < 100)
+
+    qc_issues <- c()
+    qc_pass <- TRUE
+
+    # 检查1: 总事件数
+    if(total_events < 10) {
+      qc_pass <- FALSE
+      qc_issues <- c(qc_issues, paste0("总事件数不足(", total_events, "<10)"))
+    }
+
+    # 检查2: 每组事件数
+    if(events_high < 3) {
+      qc_pass <- FALSE
+      qc_issues <- c(qc_issues, paste0("High组事件数不足(", events_high, "<3)"))
+    }
+    if(events_low < 3) {
+      qc_pass <- FALSE
+      qc_issues <- c(qc_issues, paste0("Low组事件数不足(", events_low, "<3)"))
+    }
+
+    # 检查3: 极端HR值
+    if(hr > 100) {
+      qc_pass <- FALSE
+      qc_issues <- c(qc_issues, paste0("HR值异常大(", round(hr, 2), ">100)"))
+    }
+    if(hr < 0.01) {
+      qc_pass <- FALSE
+      qc_issues <- c(qc_issues, paste0("HR值异常小(", round(hr, 4), "<0.01)"))
+    }
+
+    # 汇总质量控制状态
+    qc_summary <- if(qc_pass) "通过" else paste(qc_issues, collapse = "; ")
+
+    # 在控制台输出质量控制结果
+    if(!qc_pass) {
+      cat("    ⚠️ 质量控制未通过:", qc_summary, "\n")
+    }
+
+    # 返回结果
+    summary_stats <- data.frame(
+      Project = cancer_code,
+      Cancer_Name_CN = cancer_names_cn[cancer_code],
+      Endpoint = endpoint,
+      Endpoint_CN = ep_cn,
+      Total_samples = nrow(merged_data),
+      High_group = sum(merged_data$group == "High"),
+      Low_group = sum(merged_data$group == "Low"),
+      Events = total_events,
+      Events_High = events_high,
+      Events_Low = events_low,
+      LogRank_pvalue = p_value,
+      Cox_HR = hr,
+      Cox_pvalue = cox_pval,
+      TPM_Anomaly = has_anomaly,
+      TPM_Anomaly_Details = anomaly_summary,
+      QC_Pass = qc_pass,
+      QC_Issues = qc_summary,
+      stringsAsFactors = FALSE
+    )
+
+    return(summary_stats)
+
+  }, error = function(e) {
+    cat("    ✗ 错误:", conditionMessage(e), "\n")
+    return(NULL)
+  })
+
+  return(result)
+}
+
+# 函数：分析单个癌症类型的所有结局
+process_cancer_type_multi_endpoint <- function(cancer_code, exp_matrix, clinical) {
+
+  cat("\n=================================================================\n")
+  cat("处理项目: TCGA-", cancer_code, " (", cancer_names_cn[cancer_code], ")\n", sep="")
+  cat("=================================================================\n")
+
+  all_results <- list()
+
+  for(endpoint in ENDPOINTS) {
+    result <- process_single_endpoint(cancer_code, endpoint, exp_matrix, clinical)
+    if(!is.null(result)) {
+      all_results[[endpoint]] <- result
+    }
+  }
+
+  if(length(all_results) > 0) {
+    combined <- bind_rows(all_results)
+
+    # 保存该癌症的多结局汇总
+    results_dir <- file.path("results_multi_endpoint", cancer_code)
+    dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+    write.csv(combined, file.path(results_dir, "multi_endpoint_summary.csv"),
+              row.names = FALSE)
+
+    cat("\n✓", cancer_code, "完成 - 成功分析", nrow(combined), "个结局\n")
+    return(combined)
+  } else {
+    cat("\n✗", cancer_code, "失败 - 所有结局均无法分析\n")
+    return(NULL)
+  }
+}
+```
+
+---
+
+# 5. 批量分析所有癌症类型 × 所有结局
+
+```{r process_all}
+# 获取所有癌症类型
+all_cancers <- unique(clin_data$cancer.type.abbreviation)
+all_cancers <- all_cancers[!is.na(all_cancers)]
+all_cancers <- all_cancers[all_cancers %in% names(cancer_names_cn)]
+all_cancers <- sort(all_cancers)
+
+cat("\n找到", length(all_cancers), "个癌症类型\n")
+cat("Signature基因:", paste(SIGNATURE_GENES, collapse = ", "), "\n")
+cat("标准化基因:", NORMALIZER_GENE, "\n")
+cat("生存结局:", paste(ENDPOINTS, collapse = ", "), "\n\n")
+
+cat("开始多结局分析（预计耗时2-4小时）...\n")
+
+# 存储所有结果
+all_results <- list()
+
+for(cancer in all_cancers) {
+  result <- process_cancer_type_multi_endpoint(cancer, exp_data, clin_data)
+
+  if(!is.null(result)) {
+    all_results[[cancer]] <- result
+  }
+}
+
+# 合并所有结果
+if(length(all_results) > 0) {
+  combined_all_results <- bind_rows(all_results)
+
+  # 保存总汇总
+  write.csv(combined_all_results,
+            "results_multi_endpoint/pan_cancer_multi_endpoint_summary.csv",
+            row.names = FALSE)
+
+  cat("\n=================================================================\n")
+  cat("✓ 所有分析完成！\n")
+  cat("=================================================================\n")
+  cat("成功分析:", length(unique(combined_all_results$Project)), "个癌症类型\n")
+  cat("总结果数:", nrow(combined_all_results), "条记录\n\n")
+}
+```
+
+---
+
+# 6. 结果汇总 - 按结局分组
+
+```{r results_by_endpoint}
+if(exists("combined_all_results") && nrow(combined_all_results) > 0) {
+
+  cat("\n## 各生存结局的汇总结果\n\n")
+
+  for(endpoint in ENDPOINTS) {
+    ep_cn <- ENDPOINT_NAMES_CN[endpoint]
+    ep_desc <- ENDPOINT_DESC[endpoint]
+
+    cat("\n### ", endpoint, " (", ep_cn, ")\n\n", sep="")
+    cat("**定义**: ", ep_desc, "\n\n", sep="")
+
+    ep_results <- combined_all_results %>%
+      filter(Endpoint == endpoint) %>%
+      arrange(LogRank_pvalue)
+
+    # 显著结果
+    ep_sig <- ep_results %>%
+      filter(LogRank_pvalue < 0.05)
+
+    cat("**显著相关的癌症类型 (p < 0.05)**: ", nrow(ep_sig), " 个\n\n", sep="")
+
+    if(nrow(ep_sig) > 0) {
+      for(i in 1:nrow(ep_sig)) {
+        hr_dir <- ifelse(ep_sig$Cox_HR[i] < 1, "保护性", "风险性")
+        cat(sprintf("- **%s** (%s): p = %s, HR = %.3f (%s)\n",
+                    ep_sig$Project[i],
+                    ep_sig$Cancer_Name_CN[i],
+                    format(ep_sig$LogRank_pvalue[i], scientific = TRUE, digits = 3),
+                    ep_sig$Cox_HR[i],
+                    hr_dir))
+      }
+      cat("\n")
+    } else {
+      cat("*无显著相关的癌症类型*\n\n")
+    }
+
+    cat("---\n\n")
+  }
+}
+```
+
+---
+
+# 7. 跨结局对比分析
+
+```{r cross_endpoint_comparison}
+if(exists("combined_all_results") && nrow(combined_all_results) > 0) {
+
+  cat("\n## 跨结局对比分析\n\n")
+
+  # 创建宽格式数据：每行是一个癌症，每列是一个结局的p值
+  wide_pval <- combined_all_results %>%
+    select(Project, Cancer_Name_CN, Endpoint, LogRank_pvalue) %>%
+    pivot_wider(names_from = Endpoint,
+                values_from = LogRank_pvalue,
+                names_prefix = "pval_")
+
+  wide_hr <- combined_all_results %>%
+    select(Project, Endpoint, Cox_HR) %>%
+    pivot_wider(names_from = Endpoint,
+                values_from = Cox_HR,
+                names_prefix = "HR_")
+
+  # 合并
+  wide_combined <- wide_pval %>%
+    left_join(wide_hr, by = "Project")
+
+  # 计算每个癌症在多少个结局中显著
+  wide_combined$N_Significant <- rowSums(wide_combined[,grep("^pval_", colnames(wide_combined))] < 0.05, na.rm = TRUE)
+
+  # 识别在多个结局中都显著的癌症
+  multi_sig <- wide_combined %>%
+    filter(N_Significant >= 2) %>%
+    arrange(desc(N_Significant), Project)
+
+  cat("### 在多个结局中都显著的癌症类型 (≥2个结局 p < 0.05)\n\n")
+
+  if(nrow(multi_sig) > 0) {
+    cat("**发现", nrow(multi_sig), "个癌症类型在多个结局中显著相关:**\n\n")
+
+    for(i in 1:nrow(multi_sig)) {
+      cancer <- multi_sig$Project[i]
+      cancer_cn <- multi_sig$Cancer_Name_CN[i]
+      n_sig <- multi_sig$N_Significant[i]
+
+      cat("#### ", i, ". **", cancer, "** (", cancer_cn, ") - ",
+          n_sig, " 个结局显著\n\n", sep="")
+
+      # 显示每个结局的结果
+      cancer_results <- combined_all_results %>%
+        filter(Project == cancer) %>%
+        arrange(LogRank_pvalue)
+
+      for(j in 1:nrow(cancer_results)) {
+        ep <- cancer_results$Endpoint[j]
+        ep_cn <- cancer_results$Endpoint_CN[j]
+        pval <- cancer_results$LogRank_pvalue[j]
+        hr <- cancer_results$Cox_HR[j]
+        is_sig <- pval < 0.05
+        sig_mark <- ifelse(is_sig, "✅", "○")
+        hr_dir <- ifelse(hr < 1, "保护性", "风险性")
+
+        cat(sprintf("  %s **%s** (%s): p = %s, HR = %.3f (%s)\n",
+                    sig_mark, ep, ep_cn,
+                    format(pval, scientific = TRUE, digits = 3),
+                    hr, hr_dir))
+      }
+
+      cat("\n")
+    }
+
+    # 保存多结局显著癌症列表
+    write.csv(multi_sig,
+              "results_multi_endpoint/multi_endpoint_significant_cancers.csv",
+              row.names = FALSE)
+
+  } else {
+    cat("*未发现在多个结局中都显著的癌症类型*\n\n")
+  }
+
+  cat("---\n\n")
+
+  # 每个结局的显著癌症数统计
+  cat("### 各结局的显著癌症数量统计\n\n")
+
+  endpoint_sig_count <- combined_all_results %>%
+    group_by(Endpoint, Endpoint_CN) %>%
+    summarise(
+      Total_cancers = n(),
+      Significant = sum(LogRank_pvalue < 0.05),
+      Marginal = sum(LogRank_pvalue >= 0.05 & LogRank_pvalue < 0.10),
+      Non_significant = sum(LogRank_pvalue >= 0.10),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Significant))
+
+  kable(endpoint_sig_count,
+        caption = "各生存结局的显著癌症数量",
+        col.names = c("结局", "中文名", "总癌症数", "显著(p<0.05)", "边缘显著(0.05≤p<0.10)", "不显著(p≥0.10)"))
+
+  cat("\n")
+}
+```
+
+---
+
+# 8. 🎯 关键结果总结
+
+```{r key_findings}
+if(exists("combined_all_results") && nrow(combined_all_results) > 0) {
+
+  cat("\n## 🎯 关键结果：有预后价值的癌症类型\n\n")
+
+  # 识别关键癌症：在≥2个结局中显著，或在任一结局中p<0.01
+  key_cancers <- combined_all_results %>%
+    group_by(Project, Cancer_Name_CN) %>%
+    summarise(
+      N_endpoints_sig = sum(LogRank_pvalue < 0.05),
+      Min_pvalue = min(LogRank_pvalue),
+      Best_endpoint = Endpoint[which.min(LogRank_pvalue)],
+      .groups = "drop"
+    ) %>%
+    filter(N_endpoints_sig >= 2 | Min_pvalue < 0.01) %>%
+    arrange(desc(N_endpoints_sig), Min_pvalue)
+
+  if(nrow(key_cancers) > 0) {
+    cat("### ✅ 发现", nrow(key_cancers), "个具有明确预后价值的癌症类型\n\n")
+    cat("**标准**: 在≥2个结局中显著(p<0.05) 或 在任一结局中高度显著(p<0.01)\n\n")
+
+    # ============ 数据质量分类 ============
+    # 根据TPM质量和统计质量控制进行分类
+    sig_results_with_qc <- combined_all_results %>%
+      filter(LogRank_pvalue < 0.05) %>%
+      select(Project, Cancer_Name_CN, Endpoint, Endpoint_CN,
+             Events, Events_High, Events_Low,
+             LogRank_pvalue, Cox_HR, Cox_pvalue,
+             TPM_Anomaly, TPM_Anomaly_Details,
+             QC_Pass, QC_Issues)
+
+    # 按癌症分组统计质量状态
+    sig_cancer_qc_status <- sig_results_with_qc %>%
+      group_by(Project, Cancer_Name_CN) %>%
+      summarise(
+        N_sig_endpoints = n(),
+        N_qc_pass = sum(QC_Pass & !TPM_Anomaly),  # 完全通过：统计质量和TPM都正常
+        N_qc_fail = sum(!QC_Pass),                 # 统计质量问题
+        N_tpm_fail = sum(TPM_Anomaly & QC_Pass),   # 仅TPM问题
+        Has_any_issue = any(!QC_Pass | TPM_Anomaly),
+        .groups = "drop"
+      )
+
+    # 分类1：完全可信（统计质量和TPM质量都通过）
+    reliable_cancers <- sig_cancer_qc_status %>%
+      filter(!Has_any_issue) %>%
+      arrange(desc(N_sig_endpoints))
+
+    # 分类2：有质量问题（统计质量或TPM质量未通过）
+    unreliable_cancers <- sig_cancer_qc_status %>%
+      filter(Has_any_issue) %>%
+      arrange(desc(N_sig_endpoints))
+
+    cat("#### 📊 显著结果的数据质量分类\n\n")
+    cat("**质量控制标准**：\n")
+    cat("- ✅ **统计质量**：总事件数≥10，每组事件数≥3，0.01<HR<100\n")
+    cat("- ✅ **TPM质量**：所有signature基因无负值或异常大值\n")
+    cat("- ⚠️ **不符合以上任一标准的结果将被标记为不可信**\n\n")
+
+    if(nrow(reliable_cancers) > 0) {
+      cat("##### ✅ 完全可信的显著结果（通过所有质量检查）: ", nrow(reliable_cancers), " 个癌症\n\n", sep="")
+      cat("**这些癌症的显著结果可以放心使用**（统计质量✅ + TPM质量✅）：\n\n")
+
+      for(i in 1:nrow(reliable_cancers)) {
+        cancer <- reliable_cancers$Project[i]
+        cancer_cn <- reliable_cancers$Cancer_Name_CN[i]
+        n_sig <- reliable_cancers$N_sig_endpoints[i]
+
+        cat("- **", cancer, "** (", cancer_cn, "): ", n_sig, " 个显著结局\n", sep="")
+
+        # 显示具体的显著结局和指标（只显示完全通过质量检查的）
+        cancer_sig_details <- sig_results_with_qc %>%
+          filter(Project == cancer, QC_Pass, !TPM_Anomaly) %>%
+          arrange(LogRank_pvalue)
+
+        for(j in 1:nrow(cancer_sig_details)) {
+          ep <- cancer_sig_details$Endpoint[j]
+          ep_cn <- cancer_sig_details$Endpoint_CN[j]
+          hr <- cancer_sig_details$Cox_HR[j]
+          pval <- cancer_sig_details$LogRank_pvalue[j]
+          events <- cancer_sig_details$Events[j]
+          events_h <- cancer_sig_details$Events_High[j]
+          events_l <- cancer_sig_details$Events_Low[j]
+
+          cat("  - ", ep, " (", ep_cn, "): HR = ",
+              format(hr, digits = 3, nsmall = 2),
+              ", p = ", format(pval, scientific = TRUE, digits = 2),
+              " [事件数: ", events, " (H:", events_h, "/L:", events_l, ")]\n", sep="")
+        }
+      }
+      cat("\n")
+    }
+
+    if(nrow(unreliable_cancers) > 0) {
+      cat("##### ⚠️ 不可信的显著结果（存在数据质量问题）: ", nrow(unreliable_cancers), " 个癌症\n\n", sep="")
+      cat("**警告：这些癌症虽然显示统计显著性，但数据质量不符合标准，结果不可靠，不应使用**：\n\n")
+
+      for(i in 1:nrow(unreliable_cancers)) {
+        cancer <- unreliable_cancers$Project[i]
+        cancer_cn <- unreliable_cancers$Cancer_Name_CN[i]
+        n_sig <- unreliable_cancers$N_sig_endpoints[i]
+        n_qc_fail <- unreliable_cancers$N_qc_fail[i]
+        n_tpm_fail <- unreliable_cancers$N_tpm_fail[i]
+
+        cat("- **", cancer, "** (", cancer_cn, "): ", n_sig, " 个显著结局\n", sep="")
+
+        # 显示统计质量问题的结局
+        if(n_qc_fail > 0) {
+          cancer_qc_issues <- sig_results_with_qc %>%
+            filter(Project == cancer, !QC_Pass)
+
+          cat("  - 🚫 **统计质量问题** (", n_qc_fail, "个结局): ", sep="")
+          for(j in 1:nrow(cancer_qc_issues)) {
+            ep <- cancer_qc_issues$Endpoint[j]
+            qc_issue <- cancer_qc_issues$QC_Issues[j]
+            hr <- cancer_qc_issues$Cox_HR[j]
+            events <- cancer_qc_issues$Events[j]
+
+            cat("\n    - ", ep, ": ", qc_issue, sep="")
+            if(hr > 100 || hr < 0.01) {
+              cat(" [HR=", format(hr, scientific = TRUE, digits = 2), "]", sep="")
+            }
+          }
+          cat("\n")
+        }
+
+        # 显示TPM质量问题的结局（但统计质量通过）
+        if(n_tpm_fail > 0) {
+          cancer_tpm_issues <- sig_results_with_qc %>%
+            filter(Project == cancer, QC_Pass, TPM_Anomaly)
+
+          cat("  - ⚠️ **TPM数据问题** (", n_tpm_fail, "个结局): ", sep="")
+          for(j in 1:nrow(cancer_tpm_issues)) {
+            ep <- cancer_tpm_issues$Endpoint[j]
+            tpm_detail <- cancer_tpm_issues$TPM_Anomaly_Details[j]
+
+            cat("\n    - ", ep, ": ", tpm_detail, sep="")
+          }
+          cat("\n")
+        }
+        cat("\n")
+      }
+    }
+
+    cat("---\n\n")
+
+    # 原有的详细列表（只展示可信的癌症）
+    if(nrow(reliable_cancers) > 0) {
+      cat("### 📋 可信结果详细报告\n\n")
+      cat("以下仅展示**通过所有质量检查**的癌症类型详细结果（统计质量✅ + TPM质量✅）：\n\n")
+
+      display_cancers <- key_cancers %>%
+        filter(Project %in% reliable_cancers$Project)
+
+      for(i in 1:nrow(display_cancers)) {
+        cancer <- display_cancers$Project[i]
+        cancer_cn <- display_cancers$Cancer_Name_CN[i]
+        n_sig <- display_cancers$N_endpoints_sig[i]
+        min_p <- display_cancers$Min_pvalue[i]
+        best_ep <- display_cancers$Best_endpoint[i]
+
+        cat("#### ", i, ". **", cancer, "** (", cancer_cn, ") ✅\n\n", sep="")
+
+        cat("- **显著结局数**: ", n_sig, " / ", length(ENDPOINTS), "\n", sep="")
+        cat("- **最佳结局**: ", best_ep, " (", ENDPOINT_NAMES_CN[best_ep],
+            "), p = ", format(min_p, scientific = TRUE, digits = 3), "\n", sep="")
+
+        # 详细结果
+        cancer_details <- combined_all_results %>%
+          filter(Project == cancer) %>%
+          arrange(LogRank_pvalue)
+
+        cat("\n**各结局详细结果**:\n\n")
+        cat("| 结局 | 中文名 | 样本数 | 事件数 | Log-rank p值 | Cox HR | TPM状态 | 解读 |\n")
+        cat("|------|--------|--------|--------|--------------|--------|---------|------|\n")
+
+        for(j in 1:nrow(cancer_details)) {
+          ep <- cancer_details$Endpoint[j]
+          ep_cn <- cancer_details$Endpoint_CN[j]
+          n_samples <- cancer_details$Total_samples[j]
+          n_events <- cancer_details$Events[j]
+          pval <- cancer_details$LogRank_pvalue[j]
+          hr <- cancer_details$Cox_HR[j]
+          tpm_status <- if(cancer_details$TPM_Anomaly[j]) "❌异常" else "✅正常"
+
+          sig_mark <- ifelse(pval < 0.01, "✅✅",
+                            ifelse(pval < 0.05, "✅", "○"))
+          hr_dir <- ifelse(hr < 1, "High组生存更好", "Low组生存更好")
+
+          cat(sprintf("| %s %s | %s | %d | %d | %s | %.3f | %s | %s |\n",
+                      sig_mark, ep, ep_cn, n_samples, n_events,
+                      format(pval, scientific = TRUE, digits = 3),
+                      hr, tpm_status, hr_dir))
+        }
+
+        cat("\n**生存曲线位置**:\n")
+        for(ep in ENDPOINTS) {
+          if(file.exists(file.path("figures_multi_endpoint", ep, cancer, "survival_curve.pdf"))) {
+            cat("- ", ep, ": `figures_multi_endpoint/", ep, "/", cancer, "/survival_curve.pdf`\n", sep="")
+          }
+        }
+
+        cat("\n---\n\n")
+      }
+    }
+
+    # 保存可信的癌症列表
+    if(nrow(reliable_cancers) > 0) {
+      write.csv(reliable_cancers,
+                "results_multi_endpoint/reliable_significant_cancers.csv",
+                row.names = FALSE)
+      cat("\n💾 **可信的显著癌症列表已保存**: `results_multi_endpoint/reliable_significant_cancers.csv`\n\n")
+    }
+
+    # 保存所有关键癌症列表（包含可信和不可信）
+    write.csv(key_cancers,
+              "results_multi_endpoint/key_prognostic_cancers.csv",
+              row.names = FALSE)
+    cat("💾 **所有关键癌症列表已保存**: `results_multi_endpoint/key_prognostic_cancers.csv`\n\n")
+
+  } else {
+    cat("### ⚠️ 未发现符合标准的关键癌症类型\n\n")
+    cat("建议:\n")
+    cat("- 考虑调整signature定义\n")
+    cat("- 尝试其他分析方法\n\n")
+  }
+
+  cat("---\n\n")
+
+  # 结局优先级建议
+  cat("### 📊 结局选择建议\n\n")
+
+  endpoint_priority <- combined_all_results %>%
+    group_by(Endpoint, Endpoint_CN) %>%
+    summarise(
+      N_significant = sum(LogRank_pvalue < 0.05),
+      Mean_HR = mean(Cox_HR[LogRank_pvalue < 0.05], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(N_significant))
+
+  if(nrow(endpoint_priority) > 0) {
+    best_endpoint <- endpoint_priority$Endpoint[1]
+    best_ep_cn <- endpoint_priority$Endpoint_CN[1]
+    best_n_sig <- endpoint_priority$N_significant[1]
+
+    cat("**最有预后价值的结局**: ", best_endpoint, " (", best_ep_cn, ")\n", sep="")
+    cat("- 显著癌症数: ", best_n_sig, " 个\n", sep="")
+    cat("- 描述: ", ENDPOINT_DESC[best_endpoint], "\n\n", sep="")
+
+    cat("**各结局预后价值排序**:\n\n")
+    for(i in 1:nrow(endpoint_priority)) {
+      ep <- endpoint_priority$Endpoint[i]
+      ep_cn <- endpoint_priority$Endpoint_CN[i]
+      n_sig <- endpoint_priority$N_significant[i]
+
+      cat(sprintf("%d. **%s** (%s): %d 个显著癌症\n",
+                  i, ep, ep_cn, n_sig))
+    }
+    cat("\n")
+  }
+}
+```
+
+---
+
+# 9. 📋 数据质量控制报告
+
+## 9.1 统计质量控制：不符合标准的结果
+
+```{r statistical_quality_control}
+if(exists("combined_all_results") && nrow(combined_all_results) > 0) {
+
+  cat("\n## 统计质量控制检查\n\n")
+
+  cat("**质量标准**：\n")
+  cat("1. **总事件数** ≥ 10\n")
+  cat("2. **每组事件数** ≥ 3 (High组和Low组分别)\n")
+  cat("3. **HR值合理范围**: 0.01 < HR < 100\n\n")
+
+  cat("**说明**: 不符合以上任一标准的结果被视为**统计不可靠**，通常由于：\n")
+  cat("- 样本量不足\n")
+  cat("- 事件数太少（完全或准完全分离）\n")
+  cat("- 随访时间不足\n\n")
+
+  # 筛选未通过质量控制的记录（显著的）
+  qc_failures <- combined_all_results %>%
+    filter(LogRank_pvalue < 0.05, !QC_Pass)
+
+  if(nrow(qc_failures) > 0) {
+    cat("### ⚠️ 发现", nrow(qc_failures), "条显著结果未通过统计质量控制\n\n")
+    cat("**重要警告**: 以下结果虽然p<0.05，但统计质量不足，**不应使用**！\n\n")
+
+    # 按癌症分组汇总
+    qc_fail_by_cancer <- qc_failures %>%
+      group_by(Project, Cancer_Name_CN) %>%
+      summarise(
+        Affected_Endpoints = paste(Endpoint, collapse = ", "),
+        N_Affected = n(),
+        Issues = paste(unique(QC_Issues), collapse = "; "),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(N_Affected), Project)
+
+    cat("#### 受影响的癌症类型汇总\n\n")
+
+    for(i in 1:nrow(qc_fail_by_cancer)) {
+      cancer <- qc_fail_by_cancer$Project[i]
+      cancer_cn <- qc_fail_by_cancer$Cancer_Name_CN[i]
+      n_affected <- qc_fail_by_cancer$N_Affected[i]
+      endpoints <- qc_fail_by_cancer$Affected_Endpoints[i]
+      issues <- qc_fail_by_cancer$Issues[i]
+
+      cat("##### ", i, ". **", cancer, "** (", cancer_cn, ") 🚫\n\n", sep="")
+      cat("- **受影响的结局**: ", endpoints, " (", n_affected, " / ", length(ENDPOINTS), ")\n", sep="")
+      cat("- **质量问题**: ", issues, "\n", sep="")
+      cat("- **数据可用性**: ⛔ **不可用** - 样本量或事件数不足\n")
+      cat("- **建议**: 需要更大样本量或更长随访时间验证\n\n")
+    }
+
+    # 详细列表
+    cat("\n#### 详细问题列表\n\n")
+
+    qc_failures_sorted <- qc_failures %>%
+      arrange(Project, Endpoint)
+
+    for(i in 1:nrow(qc_failures_sorted)) {
+      row <- qc_failures_sorted[i,]
+      cat("- **", row$Project, " - ", row$Endpoint, "**: ",
+          "事件数=", row$Events, " (H:", row$Events_High, "/L:", row$Events_Low, "), ",
+          "HR=", format(row$Cox_HR, scientific = TRUE, digits = 2), " | ",
+          row$QC_Issues, "\n", sep="")
+    }
+
+    # 保存质量控制失败的列表
+    write.csv(qc_failures,
+              "results_multi_endpoint/qc_failures.csv",
+              row.names = FALSE)
+    cat("\n> ✓ 质量控制失败的详细列表已保存至: `results_multi_endpoint/qc_failures.csv`\n\n")
+
+  } else {
+    cat("### ✅ 所有显著结果均通过统计质量控制\n\n")
+  }
+
+  # 统计所有结果的质量状态（包括非显著的）
+  cat("\n### 📊 整体质量控制统计\n\n")
+
+  qc_stats <- combined_all_results %>%
+    summarise(
+      Total = n(),
+      QC_Pass = sum(QC_Pass),
+      QC_Fail = sum(!QC_Pass),
+      Pass_Rate = round(100 * sum(QC_Pass) / n(), 1)
+    )
+
+  cat("- **总分析数**: ", qc_stats$Total, " 条记录\n", sep="")
+  cat("- **通过质量控制**: ", qc_stats$QC_Pass, " 条 (", qc_stats$Pass_Rate, "%)\n", sep="")
+  cat("- **未通过质量控制**: ", qc_stats$QC_Fail, " 条 (", 100-qc_stats$Pass_Rate, "%)\n\n", sep="")
+}
+```
+
+---
+
+## 9.2 TPM数据质量：转换异常报告
+
+```{r tpm_quality_control}
+if(exists("combined_all_results") && nrow(combined_all_results) > 0) {
+
+  cat("\n## TPM转换质量检查\n\n")
+
+  cat("**检查目的**: 确保所有基因表达数据正确从 log2(TPM+1) 转换到 TPM 空间\n\n")
+
+  # 筛选有TPM异常的记录
+  tpm_anomalies <- combined_all_results %>%
+    filter(TPM_Anomaly == TRUE)
+
+  if(nrow(tpm_anomalies) > 0) {
+    cat("### ⚠️ 发现", nrow(tpm_anomalies), "条记录存在TPM异常\n\n")
+
+    cat("**重要警告**: 以下癌症类型在指定结局中的数据存在TPM异常，**不应使用这些结果**！\n\n")
+
+    # 按癌症分组汇总
+    anomaly_by_cancer <- tpm_anomalies %>%
+      group_by(Project, Cancer_Name_CN) %>%
+      summarise(
+        Affected_Endpoints = paste(Endpoint, collapse = ", "),
+        N_Affected = n(),
+        Details = paste(unique(TPM_Anomaly_Details), collapse = "; "),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(N_Affected), Project)
+
+    cat("#### 受影响的癌症类型汇总\n\n")
+
+    for(i in 1:nrow(anomaly_by_cancer)) {
+      cancer <- anomaly_by_cancer$Project[i]
+      cancer_cn <- anomaly_by_cancer$Cancer_Name_CN[i]
+      n_affected <- anomaly_by_cancer$N_Affected[i]
+      endpoints <- anomaly_by_cancer$Affected_Endpoints[i]
+      details <- anomaly_by_cancer$Details[i]
+
+      cat("##### ", i, ". **", cancer, "** (", cancer_cn, ") ❌\n\n", sep="")
+      cat("- **受影响的结局**: ", endpoints, " (", n_affected, " / ", length(ENDPOINTS), ")\n", sep="")
+      cat("- **异常详情**: ", details, "\n", sep="")
+      cat("- **数据可用性**: ⛔ **不可用** - 数据转换存在问题\n")
+      cat("- **建议**: 检查原始数据质量，或从分析中排除该癌症类型\n\n")
+    }
+
+    # 详细列表
+    cat("\n#### 详细异常列表\n\n")
+    cat("| 癌症 | 中文名 | 结局 | 异常基因与原因 |\n")
+    cat("|------|--------|------|----------------|\n")
+
+    for(i in 1:nrow(tpm_anomalies)) {
+      cat(sprintf("| %s | %s | %s | %s |\n",
+                  tpm_anomalies$Project[i],
+                  tpm_anomalies$Cancer_Name_CN[i],
+                  tpm_anomalies$Endpoint[i],
+                  tpm_anomalies$TPM_Anomaly_Details[i]))
+    }
+
+    cat("\n")
+
+    # 保存异常记录
+    write.csv(tpm_anomalies,
+              "results_multi_endpoint/TPM_anomalies.csv",
+              row.names = FALSE)
+    cat("💾 **TPM异常记录已保存**: `results_multi_endpoint/TPM_anomalies.csv`\n\n")
+
+    # 统计异常类型
+    cat("### 📊 异常类型统计\n\n")
+
+    # 统计负数异常
+    n_negative <- sum(grepl("负数", tpm_anomalies$TPM_Anomaly_Details))
+    # 统计异常大值
+    n_large <- sum(grepl("异常大", tpm_anomalies$TPM_Anomaly_Details))
+
+    cat("- **负数异常**: ", n_negative, " 条记录\n", sep="")
+    cat("  - 原因: 数据转换公式错误或原始数据损坏\n")
+    cat("  - 影响: TPM值不应该有负数\n\n")
+
+    cat("- **异常大值**: ", n_large, " 条记录\n", sep="")
+    cat("  - 原因: 数据损坏、转换公式错误或数据单位不对\n")
+    cat("  - 影响: 正常基因表达很少超过100,000 TPM\n\n")
+
+    cat("---\n\n")
+
+  } else {
+    cat("### ✅ 所有数据通过TPM质量检查\n\n")
+    cat("**结果**: 所有", nrow(combined_all_results), "条分析记录的基因表达数据均已正确转换到TPM空间。\n\n")
+
+    cat("**验证项目**:\n")
+    cat("- ✅ 所有基因TPM值均为非负数\n")
+    cat("- ✅ 所有基因TPM值在合理范围内 (< 100,000)\n")
+    cat("- ✅ 数据转换公式正确: TPM = 2^log2(TPM+1) - 1\n\n")
+
+    cat("**结论**: 所有分析结果均可信赖，数据质量良好。\n\n")
+  }
+
+  # 无论是否有异常，都显示质量控制标准
+  cat("### 📖 TPM质量控制标准\n\n")
+
+  cat("**正常TPM范围** (RNA-seq):\n")
+  cat("- 低表达基因: 0-10 TPM\n")
+  cat("- 中等表达: 10-100 TPM\n")
+  cat("- 高表达: 100-10,000 TPM\n")
+  cat("- 极高表达 (管家基因): 10,000-50,000 TPM\n\n")
+
+  cat("**异常判定阈值**:\n")
+  cat("- ⚠️ **负数** (< 0): 绝对不应该出现，说明转换错误\n")
+  cat("- ⚠️ **异常大** (> 100,000): 罕见，可能是数据问题\n\n")
+
+  cat("**我们的signature基因预期范围**:\n")
+  cat("- CCR7, LAMP3, FSCN1: 0-5,000 TPM (免疫细胞标志物)\n")
+  cat("- CD3G: 0-10,000 TPM (T细胞高表达)\n\n")
+}
+```
+
+---
+
+# 10. 会话信息
+
+```{r session_info}
+sessionInfo()
+```
+
+---
+
+# 总结
+
+本分析使用**UCSC Xena TCGA Pan-Cancer Atlas数据**（Liu et al. Cell 2018），对CCR7+ mregDC signature进行了**多结局生存分析**。
+
+**Signature定义**: `r SIGNATURE_NAME`
+
+**分析的4个生存结局**:
+```{r summary_endpoints, echo=FALSE, results='asis'}
+for(ep in ENDPOINTS) {
+  cat("- **", ep, "** (", ENDPOINT_NAMES_CN[ep], "): ", ENDPOINT_DESC[ep], "\n", sep="")
+}
+```
+
+**主要发现**:
+- 全面评估了signature在4个标准化生存结局中的预后价值
+- 识别了在多个结局中都显著的癌症类型
+- 为后续深入研究提供了方向
+
+**数据来源**:
+- Liu J, et al. An Integrated TCGA Pan-Cancer Clinical Data Resource to Drive High-Quality Survival Outcome Analytics. Cell. 2018.
+- UCSC Xena - TCGA Pan-Cancer Atlas Hub
+
+**报告生成时间**: `r Sys.time()`
